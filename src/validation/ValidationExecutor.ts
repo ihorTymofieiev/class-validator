@@ -1,14 +1,13 @@
 import {Validator} from "./Validator";
 import {ValidationError} from "./ValidationError";
 import {ValidationMetadata} from "../metadata/ValidationMetadata";
-import {MetadataStorage} from "../metadata/MetadataStorage";
-import {getFromContainer} from "../container";
 import {ValidatorOptions} from "./ValidatorOptions";
 import {ValidationTypes} from "./ValidationTypes";
 import {ConstraintMetadata} from "../metadata/ConstraintMetadata";
 import {ValidationArguments} from "./ValidationArguments";
 import {ValidationUtils} from "./ValidationUtils";
-import {isPromise} from "../utils";
+import {isPromise, convertToArray} from "../utils";
+import { getMetadataStorage } from "../metadata/MetadataStorage";
 
 /**
  * Executes validation over given object.
@@ -26,7 +25,7 @@ export class ValidationExecutor {
     // Private Properties
     // -------------------------------------------------------------------------
 
-    private metadataStorage = getFromContainer(MetadataStorage);
+    private metadataStorage = getMetadataStorage();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -40,7 +39,7 @@ export class ValidationExecutor {
     // Public Methods
     // -------------------------------------------------------------------------
 
-    execute(object: Object, targetSchema: string, validationErrors: ValidationError[]) {
+    execute(object: object, targetSchema: string, validationErrors: ValidationError[]): void {
         /**
          * If there is no metadata registered it means possibly the dependencies are not flatterned and
          * more than one instance is used.
@@ -96,8 +95,8 @@ export class ValidationExecutor {
 
     whitelist(object: any,
               groupedMetadatas: { [propertyName: string]: ValidationMetadata[] },
-              validationErrors: ValidationError[]) {
-        let notAllowedProperties: string[] = [];
+              validationErrors: ValidationError[]): void {
+        const notAllowedProperties: string[] = [];
 
         Object.keys(object).forEach(propertyName => {
             // does this property have no metadata?
@@ -111,22 +110,22 @@ export class ValidationExecutor {
 
                 // throw errors
                 notAllowedProperties.forEach(property => {
-                    validationErrors.push({
-                        target: object, property, value: (object as any)[property], children: undefined,
-                        constraints: { [ValidationTypes.WHITELIST]: `property ${property} should not exist` }
-                    });
+                    const validationError: ValidationError = this.generateValidationError(object, (object)[property], property);
+                    validationError.constraints = { [ValidationTypes.WHITELIST]: `property ${property} should not exist` };
+                    validationError.children = undefined;
+                    validationErrors.push(validationError);
                 });
 
             } else {
 
                 // strip non allowed properties
-                notAllowedProperties.forEach(property => delete (object as any)[property]);
+                notAllowedProperties.forEach(property => delete (object)[property]);
 
             }
         }
     }
 
-    stripEmptyErrors(errors: ValidationError[]) {
+    stripEmptyErrors(errors: ValidationError[]): ValidationError[] {
         return errors.filter(error => {
             if (error.children) {
                 error.children = this.stripEmptyErrors(error.children);
@@ -152,7 +151,7 @@ export class ValidationExecutor {
                                 value: any, propertyName: string,
                                 definedMetadatas: ValidationMetadata[],
                                 metadatas: ValidationMetadata[],
-                                validationErrors: ValidationError[]) {
+                                validationErrors: ValidationError[]): void {
 
         const customValidationMetadatas = metadatas.filter(metadata => metadata.type === ValidationTypes.CUSTOM_VALIDATION);
         const nestedValidationMetadatas = metadatas.filter(metadata => metadata.type === ValidationTypes.NESTED_VALIDATION);
@@ -167,7 +166,8 @@ export class ValidationExecutor {
         }
 
         // handle IS_DEFINED validation type the special way - it should work no matter skipUndefinedProperties/skipMissingProperties is set or not
-        this.defaultValidations(object, value, definedMetadatas, validationError.constraints);
+        this.customValidations(object, value, definedMetadatas, validationError);
+        this.mapContexts(object, value, definedMetadatas, validationError);
 
         if (value === undefined && this.validatorOptions && this.validatorOptions.skipUndefinedProperties === true) {
             return;
@@ -181,14 +181,14 @@ export class ValidationExecutor {
             return;
         }
 
-        this.defaultValidations(object, value, metadatas, validationError.constraints);
-        this.customValidations(object, value, customValidationMetadatas, validationError.constraints);
+        this.customValidations(object, value, customValidationMetadatas, validationError);
         this.nestedValidations(value, nestedValidationMetadatas, validationError.children);
 
         this.mapContexts(object, value, metadatas, validationError);
+        this.mapContexts(object, value, customValidationMetadatas, validationError);
     }
 
-    private generateValidationError(object: Object, value: any, propertyName: string) {
+    private generateValidationError(object: object, value: any, propertyName: string): ValidationError {
         const validationError = new ValidationError();
 
         if (!this.validatorOptions ||
@@ -210,42 +210,21 @@ export class ValidationExecutor {
         return validationError;
     }
 
-    private conditionalValidations(object: Object,
+    private conditionalValidations(object: object,
                                    value: any,
-                                   metadatas: ValidationMetadata[]) {
+                                   metadatas: ValidationMetadata[]): ValidationMetadata[] {
         return metadatas
             .map(metadata => metadata.constraints[0](object, value))
             .reduce((resultA, resultB) => resultA && resultB, true);
     }
 
-    private defaultValidations(object: Object,
-                               value: any,
-                               metadatas: ValidationMetadata[],
-                               errorMap: { [key: string]: string }) {
-        return metadatas
-            .filter(metadata => {
-                if (metadata.each) {
-                    if (value instanceof Array) {
-                        return !value.every((subValue: any) => this.validator.validateValueByMetadata(subValue, metadata));
-                    }
-
-                } else {
-                    return !this.validator.validateValueByMetadata(value, metadata);
-                }
-            })
-            .forEach(metadata => {
-                const [key, message] = this.createValidationError(object, value, metadata);
-                errorMap[key] = message;
-            });
-    }
-
-    private customValidations(object: Object,
+    private customValidations(object: object,
                               value: any,
                               metadatas: ValidationMetadata[],
-                              errorMap: { [key: string]: string }) {
+                              error: ValidationError): void {
 
         metadatas.forEach(metadata => {
-            getFromContainer(MetadataStorage)
+            this.metadataStorage
                 .getTargetValidatorConstraints(metadata.constraintCls)
                 .forEach(customConstraintMetadata => {
                     if (customConstraintMetadata.async && this.ignoreAsyncValidations)
@@ -258,37 +237,74 @@ export class ValidationExecutor {
                         value: value,
                         constraints: metadata.constraints
                     };
-                    const validatedValue = customConstraintMetadata.instance.validate(value, validationArguments);
-                    if (isPromise(validatedValue)) {
-                        const promise = validatedValue.then(isValid => {
-                            if (!isValid) {
+
+                    if (!metadata.each || !(value instanceof Array || value instanceof Set || value instanceof Map)) {
+                        const validatedValue = customConstraintMetadata.instance.validate(value, validationArguments);
+                        if (isPromise(validatedValue)) {
+                            const promise = validatedValue.then(isValid => {
+                                if (!isValid) {
+                                    const [type, message] = this.createValidationError(object, value, metadata, customConstraintMetadata);
+                                    error.constraints[type] = message;
+                                    if (metadata.context) {
+                                        if (!error.contexts) {
+                                            error.contexts = {};
+                                        }
+                                        error.contexts[type] = Object.assign((error.contexts[type] || {}), metadata.context);
+                                    }
+                                }
+                            });
+                            this.awaitingPromises.push(promise);
+                        } else {
+                            if (!validatedValue) {
                                 const [type, message] = this.createValidationError(object, value, metadata, customConstraintMetadata);
-                                errorMap[type] = message;
+                                error.constraints[type] = message;
                             }
-                        });
-                        this.awaitingPromises.push(promise);
-                    } else {
-                        if (!validatedValue) {
-                            const [type, message] = this.createValidationError(object, value, metadata, customConstraintMetadata);
-                            errorMap[type] = message;
                         }
+
+                        return;
+                    }
+
+                    // convert set and map into array
+                    const arrayValue = convertToArray(value);
+                    // Validation needs to be applied to each array item
+                    const validatedSubValues = arrayValue.map((subValue: any) => customConstraintMetadata.instance.validate(subValue, validationArguments));
+                    const validationIsAsync = validatedSubValues
+                        .some((validatedSubValue: boolean | Promise<boolean>) => isPromise(validatedSubValue));
+
+                    if (validationIsAsync) {
+                        // Wrap plain values (if any) in promises, so that all are async
+                        const asyncValidatedSubValues = validatedSubValues
+                            .map((validatedSubValue: boolean | Promise<boolean>) => isPromise(validatedSubValue) ? validatedSubValue : Promise.resolve(validatedSubValue));
+                        const asyncValidationIsFinishedPromise = Promise.all(asyncValidatedSubValues)
+                            .then((flatValidatedValues: boolean[]) => {
+                                const validationResult = flatValidatedValues.every((isValid: boolean) => isValid);
+                                if (!validationResult) {
+                                    const [type, message] = this.createValidationError(object, value, metadata, customConstraintMetadata);
+                                    error.constraints[type] = message;
+                                    if (metadata.context) {
+                                        if (!error.contexts) {
+                                            error.contexts = {};
+                                        }
+                                        error.contexts[type] = Object.assign((error.contexts[type] || {}), metadata.context);
+                                    }
+                                }
+                            });
+
+                        this.awaitingPromises.push(asyncValidationIsFinishedPromise);
+
+                        return;
+                    }
+
+                    const validationResult = validatedSubValues.every((isValid: boolean) => isValid);
+                    if (!validationResult) {
+                        const [type, message] = this.createValidationError(object, value, metadata, customConstraintMetadata);
+                        error.constraints[type] = message;
                     }
                 });
         });
     }
 
-    private nestedPromiseValidations(value: any, metadatas: ValidationMetadata[], errors: ValidationError[]) {
-
-        if (!(value instanceof Promise)) {
-            return;
-        }
-
-        this.awaitingPromises.push(
-            value.then(resolvedValue => this.nestedValidations(resolvedValue, metadatas, errors))
-        );
-    }
-
-    private nestedValidations(value: any, metadatas: ValidationMetadata[], errors: ValidationError[]) {
+    private nestedValidations(value: any, metadatas: ValidationMetadata[], errors: ValidationError[]): void {
 
         if (value === void 0) {
             return;
@@ -302,44 +318,23 @@ export class ValidationExecutor {
                 return;
             }
 
-            const targetSchema = typeof metadata.target === "string" ? metadata.target as string : undefined;
-
-            if (value instanceof Array) {
-                value.forEach((subValue: any, index: number) => {
-                    const validationError = this.generateValidationError(value, subValue, index.toString());
-                    errors.push(validationError);
-
-                    this.execute(subValue, targetSchema, validationError.children);
-                });
-
-            } else if (value instanceof Set) {
-                let index = 0;
-                value.forEach((subValue: any) => {
-                    const validationError = this.generateValidationError(value, subValue, index.toString());
-                    errors.push(validationError);
-
-                    this.execute(subValue, targetSchema, validationError.children);
-
-                    ++index;
-                });
-
-            } else if (value instanceof Map) {
-                value.forEach((subValue: any, key: any) => {
-                    const validationError = this.generateValidationError(value, subValue, key.toString());
-                    errors.push(validationError);
-
-                    this.execute(subValue, targetSchema, validationError.children);
+            if (value instanceof Array || value instanceof Set || value instanceof Map) {
+                // Treats Set as an array - as index of Set value is value itself and it is common case to have Object as value
+                const arrayLikeValue = value instanceof Set ? Array.from(value) : value;
+                arrayLikeValue.forEach((subValue: any, index: any) => {
+                    this.performValidations(value, subValue, index.toString(), [], metadatas, errors);
                 });
 
             } else if (value instanceof Object) {
+                const targetSchema = typeof metadata.target === "string" ? metadata.target : metadata.target.name;
                 this.execute(value, targetSchema, errors);
 
             } else {
                 const error = new ValidationError();
                 error.value = value;
                 error.property = metadata.propertyName;
-                error.target = metadata.target;
-                const [type, message] = this.createValidationError(metadata.target, value, metadata);
+                error.target = metadata.target as object;
+                const [type, message] = this.createValidationError(metadata.target as object, value, metadata);
                 error.constraints = {
                     [type]: message
                 };
@@ -348,15 +343,21 @@ export class ValidationExecutor {
         });
     }
 
-    private mapContexts(object: Object,
+    private mapContexts(object: object,
                         value: any,
                         metadatas: ValidationMetadata[],
-                        error: ValidationError) {
+                        error: ValidationError): void {
 
         return metadatas
             .forEach(metadata => {
                 if (metadata.context) {
-                    const type = this.getConstraintType(metadata);
+                    let customConstraint;
+                    if (metadata.type === ValidationTypes.CUSTOM_VALIDATION) {
+                        const customConstraints = this.metadataStorage.getTargetValidatorConstraints(metadata.constraintCls);
+                        customConstraint = customConstraints[0];
+                    }
+
+                    const type = this.getConstraintType(metadata, customConstraint);
 
                     if (error.constraints[type]) {
                         if (!error.contexts) {
@@ -369,7 +370,7 @@ export class ValidationExecutor {
             });
     }
 
-    private createValidationError(object: Object,
+    private createValidationError(object: object,
                                   value: any,
                                   metadata: ValidationMetadata,
                                   customValidatorMetadata?: ConstraintMetadata): [string, string] {
@@ -384,15 +385,12 @@ export class ValidationExecutor {
             constraints: metadata.constraints
         };
 
-        let message = metadata.message;
+        let message = metadata.message || "";
         if (!metadata.message &&
             (!this.validatorOptions || (this.validatorOptions && !this.validatorOptions.dismissDefaultMessages))) {
             if (customValidatorMetadata && customValidatorMetadata.instance.defaultMessage instanceof Function) {
                 message = customValidatorMetadata.instance.defaultMessage(validationArguments);
             }
-
-            if (!message)
-                message = ValidationTypes.getMessage(type, metadata.each);
         }
 
         const messageString = ValidationUtils.replaceMessageSpecialTokens(message, validationArguments);
